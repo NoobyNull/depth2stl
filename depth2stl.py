@@ -120,6 +120,19 @@ def simulate_bit(h, px_mm, relief_mm, tip_d, taper_deg):
     return np.clip(sweep(tip, -1, np.minimum, np.inf), 0.0, 1.0)  # surface the bit leaves
 
 
+def bit_loss(h, cut, relief_mm, mask=None, tol_mm=0.05):
+    """Plain-words summary of detail the bit can't carve: share of the model's
+    area where the carved surface sits more than tol_mm above the design, and
+    the worst spot. h/cut are 0..1 heights before/after simulate_bit."""
+    m = (h > 0) if mask is None else mask & (h > 0)
+    d = (cut - h)[m] * relief_mm
+    if not d.size:
+        return "—"
+    pct = 100 * (d > tol_mm).mean()
+    return (f"{pct:.1f}% of the area is finer than the bit (>{tol_mm:g} mm off), worst {d.max():.2f} mm"
+            if pct >= 0.05 else "all detail is carvable with this bit")
+
+
 def shading_detail(lum, fig, radius):
     """High-pass of a shaded render's luminance inside the figure, ~[-1, 1].
     Normalised blur so the black background can't halo the silhouette; tapered
@@ -787,7 +800,7 @@ def gui(path=None):
     preset_box.bind("<<ComboboxSelected>>", lambda e: apply_preset(preset_var.get()))
     refresh_presets()
 
-    stat_keys = ["Source", "Source size", "Source px", "Channel", "Render", "Canvas", "Edge fade", "Mesh px", "mm / pixel", "Bit",
+    stat_keys = ["Source", "Source size", "Source px", "Channel", "Render", "Canvas", "Edge fade", "Mesh px", "mm / pixel", "Bit", "Beyond bit",
                  "Model mm", "Z range mm", "Triangles", "STL estimate", "Process time",
                  "Last export", "Export size", "Export time"]
     stats = {}
@@ -860,9 +873,11 @@ def gui(path=None):
                        quick_shade(arr, px_mm, p, cw, zmul)))
             if p["sim"]:
                 px_mm = p["x"] / (arr.shape[1] - 1)
-                arr = simulate_bit(arr, px_mm, p["z"], p["tip"], p["taper"])
+                cut = simulate_bit(arr, px_mm, p["z"], p["tip"], p["taper"])
                 if st["gen"] != gen:
                     return
+                q.put(("bitloss", gen, bit_loss(arr, cut, p["z"], mask)))
+                arr = cut
                 q.put(("stage", gen, f"bit simulation Ø{p['tip']:g} mm", total, total, time.time() - t0,
                        quick_shade(arr, px_mm, p, cw, zmul)))
             full = Image.fromarray(shade(height_mm(arr, p["z"], p["base"], zmul), px_mm))
@@ -922,6 +937,8 @@ def gui(path=None):
         set_stat("Bit", f"tip Ø{p['tip']:g} mm = {p['tip'] / px:.1f} px"
                  + ("  (mesh coarser than the bit: Fit settings to bit)" if p["tip"] / px < 3 else "")
                  + ("  (tol ≥ tip radius!)" if p["tol"] >= p["tip"] / 2 else ""))
+        if not p["sim"]:
+            set_stat("Beyond bit", "turn on Simulate bit to measure")
         set_stat("Triangles", "meshing…"); set_stat("STL estimate", "…")
 
     # ---- X/Y/Z lock: editing one field scales the other two by the same factor
@@ -973,6 +990,8 @@ def gui(path=None):
                     _, _, label, i, total, dt, img = m
                     draw(img); prog["value"] = 100 * i / total
                     say(f"{label}  ({i}/{total}, {dt:.2f} s)")
+                elif m[0] == "bitloss":
+                    set_stat("Beyond bit", m[2])
                 elif m[0] == "done":
                     on_done(*m[2:])
                 elif m[0] == "mesh":
@@ -1142,6 +1161,7 @@ def check():
     assert (sb >= flat - 1e-6).all(), "the bit can only leave material, never remove more"
     assert sb[20, 20] > 0.49 and abs(sb[10, 10] - 0.9) < 1e-6 and abs(sb[30, 30] - 1.0) < 1e-6
     assert abs(simulate_bit(flat, px, 8.0, 0.397, 0.0)[0, 0] - 0.5) < 1e-6, "straight ball end mill"
+    assert "finer than the bit" in bit_loss(flat, sb, 8.0) and bit_loss(flat, flat, 8.0).startswith("all")
     wide = np.full((40, 40), 0.5, np.float32); wide[10:30, 10:30] = 0.0  # 1 mm pit, way wider than the tip
     assert simulate_bit(wide, px, 8.0, 0.397, 0.0)[20, 20] < 1e-6, "wide pit must be cut to the bottom"
     with tempfile.TemporaryDirectory() as dd:
@@ -1261,8 +1281,9 @@ def main():
             p, mask, zmul = remove_canvas(p, fade=a.fade)
             print(f"  {'remove leftover canvas':<24s} {time.time() - t0:6.2f} s  -> {p.shape[1]}x{p.shape[0]} px")
         if a.simulate_bit:
-            p = simulate_bit(p, a.x / (p.shape[1] - 1), a.z, a.tip, a.taper)
-            print(f"  {'bit simulation':<24s} {time.time() - t0:6.2f} s")
+            cut = simulate_bit(p, a.x / (p.shape[1] - 1), a.z, a.tip, a.taper)
+            print(f"  {'bit simulation':<24s} {time.time() - t0:6.2f} s  -> {bit_loss(p, cut, a.z, mask)}")
+            p = cut
         H, W = p.shape
         y = a.y if a.y is not None else a.x * (H - 1) / (W - 1)
         n = to_stl(p, mask, a.out, a.x, y, a.z, a.base, zmul, a.tol)
