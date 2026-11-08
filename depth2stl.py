@@ -82,6 +82,57 @@ def erode(m):
     return m & p[:-2, 1:-1] & p[2:, 1:-1] & p[1:-1, :-2] & p[1:-1, 2:]
 
 
+def bit_profile(r_mm, tip_d, taper_deg):
+    """Height (mm) of a tapered ball nose's cutting surface above its tip at
+    radius r_mm from the axis: a ball of tip_d/2, then a cone opening at
+    taper_deg per side, tangent to the ball. taper 0 = straight ball end mill."""
+    R, a = tip_d / 2, math.radians(taper_deg)
+    rt = R * math.cos(a)  # where the ball hands over to the cone
+    ball = R - np.sqrt(np.maximum(R * R - np.minimum(r_mm, R) ** 2, 0))
+    if a <= 0:
+        return np.where(r_mm <= R, ball, np.inf)
+    cone = R - R * math.sin(a) + (r_mm - rt) / math.tan(a)
+    return np.where(r_mm <= rt, ball, cone).astype(np.float32)
+
+
+def simulate_bit(h, px_mm, relief_mm, tip_d, taper_deg):
+    """What the bit can actually carve from height map h (0..1): every point
+    the tool tip can reach without the bit gouging the model, then the surface
+    the bit's shape leaves behind (morphological opening by the tool). Detail
+    finer than the tip and narrow valleys the taper can't enter fill in."""
+    R, a = tip_d / 2, math.radians(taper_deg)
+    # ponytail: brute-force max/min over every kernel offset; O(px * kernel),
+    # ~5 s on a 3000 x 1500 map. Kernel ends where the cone outgrows the relief.
+    kr = max(1, math.ceil((R + relief_mm * math.tan(a)) / px_mm))
+    dy, dx = np.mgrid[-kr:kr + 1, -kr:kr + 1]
+    t = bit_profile(np.hypot(dy, dx) * px_mm, tip_d, taper_deg) / relief_mm
+    keep = t <= 1.0
+    offs = list(zip(dy[keep], dx[keep], t[keep]))
+    H, W = h.shape
+
+    def sweep(src, sign, op, init):
+        p = np.pad(src, kr, mode="edge")
+        out = np.full_like(src, init)
+        for oy, ox, tt in offs:
+            op(out, p[kr + sign * oy:kr + sign * oy + H, kr + sign * ox:kr + sign * ox + W] - sign * np.float32(tt), out=out)
+        return out
+    tip = sweep(h, 1, np.maximum, -np.inf)       # lowest safe tip height at each spot
+    return np.clip(sweep(tip, -1, np.minimum, np.inf), 0.0, 1.0)  # surface the bit leaves
+
+
+def bit_loss(h, cut, relief_mm, mask=None, tol_mm=0.05):
+    """Plain-words summary of detail the bit can't carve: share of the model's
+    area where the carved surface sits more than tol_mm above the design, and
+    the worst spot. h/cut are 0..1 heights before/after simulate_bit."""
+    m = (h > 0) if mask is None else mask & (h > 0)
+    d = (cut - h)[m] * relief_mm
+    if not d.size:
+        return "—"
+    pct = 100 * (d > tol_mm).mean()
+    return (f"{pct:.1f}% of the area is finer than the bit (>{tol_mm:g} mm off), worst {d.max():.2f} mm"
+            if pct >= 0.05 else "all detail is carvable with this bit")
+
+
 def shading_detail(lum, fig, radius):
     """High-pass of a shaded render's luminance inside the figure, ~[-1, 1].
     Normalised blur so the black background can't halo the silhouette; tapered
@@ -489,7 +540,8 @@ def pick_file(save, start_dir, default_name, filt_name, patterns):
 
 
 DEFAULTS = dict(scale=2, floor=2, smooth=1.0, passes=10, edge=5, fade=20, boost=0.0, boost_radius=8,
-                render_amt=0.5, x=300, y=147, z=8, base=3, tol=0.02, detail=1600, invert=False, rm=True, lock=True)
+                render_amt=0.5, x=300, y=147, z=8, base=3, tol=0.02, detail=1600, tip=0.397, taper=10.0,
+                invert=False, rm=True, lock=True, sim=False)
 PRESETS = {  # built-in; user presets live in PRESET_FILE and override on name clash
     "Defaults": {},
     "Fast draft": dict(scale=1, passes=0, smooth=1.0, detail=800),
@@ -498,6 +550,55 @@ PRESETS = {  # built-in; user presets live in PRESET_FILE and override on name c
     "Full-canvas plaque": dict(rm=False, fade=0),
     "Deep carve 15 mm": dict(z=15, base=5, passes=15, edge=3),
 }
+# Hover hints for every setting, keyed like DEFAULTS. Plain words: what it does, when to touch it.
+HINTS = dict(
+    open="Load a depth map: a grey image where white = high and black = low (depth in the alpha channel works too). "
+         "Open a colour photo or render and you'll be offered the local AI depth estimate instead.",
+    estimate="Turn an ordinary picture (photo, render, artwork) into a depth map with the local AI model "
+             "(Depth Anything V2 on your GPU), then load it. The number is how much of the picture's own "
+             "shading detail (scales, hair, wrinkles) to add on top: 0 = AI depth only, 1 = strong.",
+    preset="Saved bundles of settings. 'Max detail' pushes everything toward fine texture; "
+           "'Fit to bit' below is usually better because it sizes things for your actual cutter.",
+    scale="Resample the image this many times bigger before meshing. More points per mm, so finer cuts can be "
+          "represented, but it does not invent detail and the STL grows with the square of this.",
+    floor="Anything darker than this % of full height becomes flat floor. Raise it if the background has "
+          "speckles or a faint haze; lower it if dark parts of the subject are disappearing.",
+    smooth="Blur radius in pixels. Removes jaggies and noise but also softens fine detail. "
+           "0.5 to 1 is gentle; above 3 looks melted.",
+    passes="Edge-preserving smoothing: each pass irons out small bumps but keeps big steps (outlines, layered "
+           "edges) sharp. 10 is moderate, 30+ gives a sculpted, cleaner look.",
+    edge="How big a step (% of full height) must be to count as a real edge that smoothing leaves alone. "
+         "Lower keeps more small edges crisp; higher smooths more of them away.",
+    invert="Swap high and low. Use it if your depth map is black = near (the relief comes out inside-out).",
+    rm="Keep only the main subject: drop the empty background and stray specks, crop tight, and mesh just "
+       "the figure (a cut-out instead of a plaque).",
+    fade="With the background removed: width of a sloped skirt around the outline so the model ramps down "
+         "to the floor instead of ending in a vertical wall. 0 = vertical wall.",
+    boost="Exaggerate the image's own fine texture (unsharp mask on the height). 1 doubles it, 2 triples it. "
+          "Brings out carving detail, but also amplifies noise and JPEG blocks.",
+    boost_radius="Size (px) of the detail that gets boosted and that 'Detail from render' adds. Detail smaller "
+                 "than this is lifted; larger shapes are left alone.",
+    render="Add the shading of a picture (usually the photo the depth map came from) as extra fine relief. "
+           "The number is the strength, 0 to 1. Click again to detach.",
+    x="Finished model width in millimetres.",
+    y="Finished model height (front to back) in millimetres. With the lock on it follows X so nothing stretches.",
+    z="How tall the relief is from the floor to the highest point, in millimetres (your carve depth).",
+    base="Solid backing slab under the relief, in millimetres.",
+    lock="Keep X, Y and Z in proportion: change one and the others scale with it.",
+    tol="Mesh simplification: flat-ish areas merge into bigger triangles as long as the surface stays within "
+        "this many mm. Shrinks the STL a lot. Keep it well under your bit's tip radius; 0 = every pixel.",
+    detail="Resolution of the 3D preview only (longest side, px). Does not affect the exported STL.",
+    tip="Tip diameter of your ball nose bit in mm. 1/64\" = 0.397 mm. Detail smaller than about the tip radius "
+        "can't be carved, so this sets how fine the model needs to be.",
+    taper="Taper angle of the bit per side, in degrees (check the bit's listing; 0 = straight ball end mill). "
+          "Steeper tapers can't reach the bottom of narrow, deep valleys.",
+    sim="Show (and export) only what this bit can physically carve: pits and grooves narrower than the bit "
+        "fill in, sharp inside corners round over. Use it to judge which detail will survive. A few seconds slower.",
+    fit="Set upscale, smoothing, detail boost and simplification for the bit above and the current X size: "
+        "about 4 mesh points across the tip, detail boosted up to ~1 mm, simplification below the tip radius.",
+    export="Write the STL file using the settings above.",
+)
+TIP_STYLE = dict(delay_ms=500, wrap_chars=48, pad=6)  # hover hint look; colours come from the Tk theme
 PRESET_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "depth2stl", "presets.json")
 
 
@@ -528,6 +629,14 @@ def ask_text(prompt, default=""):
     return r.stdout.strip() or None if r.returncode == 0 else None
 
 
+def looks_like_photo(path, chroma=0.04):
+    """True for a colour picture (vs a grey depth map): mean channel spread over
+    `chroma` of full scale on a small thumbnail. Grey renders read as depth maps."""
+    im = Image.open(path); im.thumbnail((256, 256))
+    a = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
+    return float((a.max(2) - a.min(2)).mean()) > chroma
+
+
 def estimator_cmd():
     """External depth estimator (depth_estimate.py in a torch venv), or None."""
     env = os.environ.get("DEPTH2STL_ESTIMATOR")
@@ -539,6 +648,7 @@ def estimator_cmd():
 
 def gui(path=None):
     import tkinter as tk
+    import tkinter.font  # noqa: F401  (tk.font for tooltip wrap width)
     from tkinter import messagebox, ttk
     from PIL import ImageTk
     Viewer = make_viewer_class()
@@ -562,25 +672,52 @@ def gui(path=None):
 
     v = {k: tk.DoubleVar(value=d) for k, d in DEFAULTS.items() if not isinstance(d, bool)}
     invert = tk.BooleanVar(value=DEFAULTS["invert"]); rm_canvas = tk.BooleanVar(value=DEFAULTS["rm"])
-    lock = tk.BooleanVar(value=DEFAULTS["lock"])
-    flags = {"invert": invert, "rm": rm_canvas, "lock": lock}
+    lock = tk.BooleanVar(value=DEFAULTS["lock"]); sim = tk.BooleanVar(value=DEFAULTS["sim"])
+    flags = {"invert": invert, "rm": rm_canvas, "lock": lock, "sim": sim}
     PROC = ("scale", "floor", "smooth", "passes", "edge", "fade", "boost", "boost_radius", "render_amt")
+    BIT = ("tip", "taper", "x", "z")  # reprocess on these only while the bit simulation is on
 
-    def row(r, label, var, lo, hi, res):
-        ttk.Label(left, text=label).grid(row=r, column=0, sticky="w")
-        ttk.Spinbox(left, textvariable=var, from_=lo, to=hi, increment=res, width=8
-                    ).grid(row=r, column=1, sticky="e", pady=2)
+    def hint(widget, key):
+        """Hover tooltip with HINTS[key]; theme colours, inverted like a native tip."""
+        text = HINTS[key]; tip = {"w": None, "job": None}
+        sty = ttk.Style()
+        fg, bg = sty.lookup("TLabel", "background") or "white", sty.lookup("TLabel", "foreground") or "black"
 
-    ttk.Button(left, text="Open depth map…", command=lambda: open_()).grid(row=0, column=0, columnspan=2, sticky="ew")
+        def show():
+            x, y = widget.winfo_rootx() + widget.winfo_width() + TIP_STYLE["pad"], widget.winfo_rooty()
+            w = tk.Toplevel(widget); w.wm_overrideredirect(True); w.wm_geometry(f"+{x}+{y}")
+            lbl = tk.Label(w, text=text, justify="left", bg=bg, fg=fg, padx=TIP_STYLE["pad"], pady=TIP_STYLE["pad"])
+            lbl.config(wraplength=tk.font.nametofont("TkDefaultFont").measure("0") * TIP_STYLE["wrap_chars"])
+            lbl.pack(); tip["w"] = w
+
+        def enter(_):
+            tip["job"] = widget.after(TIP_STYLE["delay_ms"], show)
+
+        def leave(_):
+            if tip["job"]: widget.after_cancel(tip["job"]); tip["job"] = None
+            if tip["w"]: tip["w"].destroy(); tip["w"] = None
+        widget.bind("<Enter>", enter, add="+"); widget.bind("<Leave>", leave, add="+")
+        widget.bind("<ButtonPress>", leave, add="+")
+        return widget
+
+    def row(r, label, var, lo, hi, res, key):
+        hint(ttk.Label(left, text=label), key).grid(row=r, column=0, sticky="w")
+        hint(ttk.Spinbox(left, textvariable=var, from_=lo, to=hi, increment=res, width=8), key
+             ).grid(row=r, column=1, sticky="e", pady=2)
+
+    def tick(r, label, var, key):
+        hint(ttk.Checkbutton(left, text=label, variable=var), key).grid(row=r, column=0, columnspan=2, sticky="w")
+
+    hint(ttk.Button(left, text="Open image…", command=lambda: open_()), "open").grid(row=0, column=0, columnspan=2, sticky="ew")
     est_frame = ttk.Frame(left); est_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 8))
-    est_btn = ttk.Button(est_frame, text="Estimate from render…", command=lambda: estimate_())
+    est_btn = hint(ttk.Button(est_frame, text="AI depth from picture…", command=lambda: estimate_()), "estimate")
     est_btn.pack(side="left", expand=True, fill="x")
     est_detail = tk.DoubleVar(value=0.5)
-    ttk.Spinbox(est_frame, textvariable=est_detail, from_=0, to=1, increment=0.1, width=4).pack(side="left", padx=(4, 0))
+    hint(ttk.Spinbox(est_frame, textvariable=est_detail, from_=0, to=1, increment=0.1, width=4), "estimate").pack(side="left", padx=(4, 0))
     if not estimator_cmd():
         est_btn.state(["disabled"])
     preset_var = tk.StringVar(value="Defaults")
-    preset_box = ttk.Combobox(left, textvariable=preset_var, state="readonly", width=18)
+    preset_box = hint(ttk.Combobox(left, textvariable=preset_var, state="readonly", width=18), "preset")
     preset_box.grid(row=2, column=0, columnspan=2, sticky="ew")
     pbtns = ttk.Frame(left); pbtns.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 6))
     ttk.Button(pbtns, text="Reset", width=7, command=lambda: apply_preset("Defaults")).pack(side="left", expand=True, fill="x")
@@ -590,31 +727,38 @@ def gui(path=None):
     def nrow():
         left_row[0] += 1; return left_row[0] - 1
     ttk.Label(left, text="Processing", font="TkHeadingFont").grid(row=nrow(), column=0, columnspan=2, sticky="w")
-    row(nrow(), "Upscale ×", v["scale"], 1, 4, 1)
-    row(nrow(), "Floor cutoff %", v["floor"], 0, 50, 0.5)
-    row(nrow(), "Gaussian σ px", v["smooth"], 0, 20, 0.5)
-    row(nrow(), "Diffusion passes", v["passes"], 0, 200, 1)
-    row(nrow(), "Edge keep % height", v["edge"], 0.5, 50, 0.5)
-    ttk.Checkbutton(left, text="Invert (black = high)", variable=invert).grid(row=nrow(), column=0, columnspan=2, sticky="w")
-    ttk.Checkbutton(left, text="Remove leftover canvas", variable=rm_canvas).grid(row=nrow(), column=0, columnspan=2, sticky="w")
-    row(nrow(), "Edge fade px", v["fade"], 0, 400, 2)
-    row(nrow(), "Detail boost", v["boost"], 0, 3, 0.1)
-    row(nrow(), "Detail radius px", v["boost_radius"], 2, 100, 1)
+    row(nrow(), "Upscale ×", v["scale"], 1, 4, 1, "scale")
+    row(nrow(), "Floor cutoff %", v["floor"], 0, 50, 0.5, "floor")
+    row(nrow(), "Gaussian σ px", v["smooth"], 0, 20, 0.5, "smooth")
+    row(nrow(), "Diffusion passes", v["passes"], 0, 200, 1, "passes")
+    row(nrow(), "Edge keep % height", v["edge"], 0.5, 50, 0.5, "edge")
+    tick(nrow(), "Invert (black = high)", invert, "invert")
+    tick(nrow(), "Remove leftover canvas", rm_canvas, "rm")
+    row(nrow(), "Edge fade px", v["fade"], 0, 400, 2, "fade")
+    row(nrow(), "Detail boost", v["boost"], 0, 3, 0.1, "boost")
+    row(nrow(), "Detail radius px", v["boost_radius"], 2, 100, 1, "boost_radius")
     rframe = ttk.Frame(left); rframe.grid(row=nrow(), column=0, columnspan=2, sticky="ew", pady=2)
-    render_btn = ttk.Button(rframe, text="Detail from render…", command=lambda: pick_render())
+    render_btn = hint(ttk.Button(rframe, text="Detail from render…", command=lambda: pick_render()), "render")
     render_btn.pack(side="left", expand=True, fill="x")
-    ttk.Spinbox(rframe, textvariable=v["render_amt"], from_=0, to=1, increment=0.1, width=4).pack(side="left", padx=(4, 0))
+    hint(ttk.Spinbox(rframe, textvariable=v["render_amt"], from_=0, to=1, increment=0.1, width=4), "render").pack(side="left", padx=(4, 0))
     ttk.Label(left, text="Size", font="TkHeadingFont").grid(row=nrow(), column=0, columnspan=2, sticky="w", pady=(8, 0))
-    row(nrow(), "X mm", v["x"], 1, 5000, 10)
-    row(nrow(), "Y mm", v["y"], 1, 5000, 10)
-    row(nrow(), "Z relief mm", v["z"], 0.1, 500, 0.5)
-    row(nrow(), "Base mm", v["base"], 0, 100, 0.5)
-    ttk.Checkbutton(left, text="Lock X : Y : Z", variable=lock).grid(row=nrow(), column=0, columnspan=2, sticky="w")
-    row(nrow(), "Simplify tol mm", v["tol"], 0, 0.5, 0.01)
-    row(nrow(), "3D preview px", v["detail"], 200, 6000, 200)
-    ttk.Button(left, text="Export STL…", command=lambda: export()).grid(row=nrow(), column=0, columnspan=2, sticky="ew", pady=(12, 2))
-    ttk.Label(left, text="drag: orbit · right-drag: pan\nwheel: zoom · double-click: reset",
-              foreground="#777").grid(row=nrow(), column=0, columnspan=2, sticky="w", pady=(6, 0))
+    row(nrow(), "X mm", v["x"], 1, 5000, 10, "x")
+    row(nrow(), "Y mm", v["y"], 1, 5000, 10, "y")
+    row(nrow(), "Z relief mm", v["z"], 0.1, 500, 0.5, "z")
+    row(nrow(), "Base mm", v["base"], 0, 100, 0.5, "base")
+    tick(nrow(), "Lock X : Y : Z", lock, "lock")
+    row(nrow(), "Simplify tol mm", v["tol"], 0, 0.5, 0.01, "tol")
+    row(nrow(), "3D preview px", v["detail"], 200, 6000, 200, "detail")
+    ttk.Label(left, text="Bit", font="TkHeadingFont").grid(row=nrow(), column=0, columnspan=2, sticky="w", pady=(8, 0))
+    row(nrow(), "Tip Ø mm", v["tip"], 0.05, 10, 0.001, "tip")
+    row(nrow(), "Taper ° per side", v["taper"], 0, 45, 0.5, "taper")
+    tick(nrow(), "Simulate bit (carvable only)", sim, "sim")
+    hint(ttk.Button(left, text="Fit settings to bit", command=lambda: fit_bit()), "fit"
+         ).grid(row=nrow(), column=0, columnspan=2, sticky="ew", pady=(2, 0))
+    hint(ttk.Button(left, text="Export STL…", command=lambda: export()), "export"
+         ).grid(row=nrow(), column=0, columnspan=2, sticky="ew", pady=(12, 2))
+    ttk.Label(left, text="hover a setting for help\ndrag: orbit · right-drag: pan\nwheel: zoom · double-click: reset",
+              foreground=ttk.Style().lookup("TLabel", "foreground", ["disabled"])).grid(row=nrow(), column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     # ---- presets
     def all_presets():
@@ -656,7 +800,7 @@ def gui(path=None):
     preset_box.bind("<<ComboboxSelected>>", lambda e: apply_preset(preset_var.get()))
     refresh_presets()
 
-    stat_keys = ["Source", "Source size", "Source px", "Channel", "Render", "Canvas", "Edge fade", "Mesh px", "mm / pixel",
+    stat_keys = ["Source", "Source size", "Source px", "Channel", "Render", "Canvas", "Edge fade", "Mesh px", "mm / pixel", "Bit", "Beyond bit",
                  "Model mm", "Z range mm", "Triangles", "STL estimate", "Process time",
                  "Last export", "Export size", "Export time"]
     stats = {}
@@ -677,7 +821,7 @@ def gui(path=None):
         except tk.TclError:
             return None  # half-typed number
         p.update(scale=int(p["scale"]), passes=int(p["passes"]), detail=int(p["detail"]), fade=int(p["fade"]),
-                 floor=p["floor"] / 100, edge=p["edge"] / 100, invert=invert.get(), rm=rm_canvas.get())
+                 floor=p["floor"] / 100, edge=p["edge"] / 100, invert=invert.get(), rm=rm_canvas.get(), sim=sim.get())
         return p
 
     def draw(img):
@@ -714,7 +858,7 @@ def gui(path=None):
         t0 = time.time()
         kw = {k: p[k] for k in ("scale", "smooth", "invert", "floor", "passes", "edge", "boost", "boost_radius", "render_amt")}
         kw["render"] = render
-        total = n_stages(**kw) + p["rm"]
+        total = n_stages(**kw) + p["rm"] + p["sim"]
         try:
             for i, (label, arr) in enumerate(stages(h, **kw)):
                 if st["gen"] != gen:
@@ -726,6 +870,15 @@ def gui(path=None):
             if p["rm"]:
                 arr, mask, zmul = remove_canvas(arr, fade=p["fade"])
                 q.put(("stage", gen, "remove leftover canvas", total, total, time.time() - t0,
+                       quick_shade(arr, px_mm, p, cw, zmul)))
+            if p["sim"]:
+                px_mm = p["x"] / (arr.shape[1] - 1)
+                cut = simulate_bit(arr, px_mm, p["z"], p["tip"], p["taper"])
+                if st["gen"] != gen:
+                    return
+                q.put(("bitloss", gen, bit_loss(arr, cut, p["z"], mask)))
+                arr = cut
+                q.put(("stage", gen, f"bit simulation Ø{p['tip']:g} mm", total, total, time.time() - t0,
                        quick_shade(arr, px_mm, p, cw, zmul)))
             full = Image.fromarray(shade(height_mm(arr, p["z"], p["base"], zmul), px_mm))
             q.put(("done", gen, arr, mask, zmul, full, time.time() - t0))
@@ -780,6 +933,12 @@ def gui(path=None):
         set_stat("Z range mm", f"{z.min():.3f} … {z.max():.3f}")
         set_stat("Edge fade", "—" if mask is None else
                  f"{p['fade']} px = {p['fade'] * p['x'] / (W - 1):.2f} mm" if p["fade"] else "none (vertical wall)")
+        px = p["x"] / (W - 1)
+        set_stat("Bit", f"tip Ø{p['tip']:g} mm = {p['tip'] / px:.1f} px"
+                 + ("  (mesh coarser than the bit: Fit settings to bit)" if p["tip"] / px < 3 else "")
+                 + ("  (tol ≥ tip radius!)" if p["tol"] >= p["tip"] / 2 else ""))
+        if not p["sim"]:
+            set_stat("Beyond bit", "turn on Simulate bit to measure")
         set_stat("Triangles", "meshing…"); set_stat("STL estimate", "…")
 
     # ---- X/Y/Z lock: editing one field scales the other two by the same factor
@@ -831,6 +990,8 @@ def gui(path=None):
                     _, _, label, i, total, dt, img = m
                     draw(img); prog["value"] = 100 * i / total
                     say(f"{label}  ({i}/{total}, {dt:.2f} s)")
+                elif m[0] == "bitloss":
+                    set_stat("Beyond bit", m[2])
                 elif m[0] == "done":
                     on_done(*m[2:])
                 elif m[0] == "mesh":
@@ -878,13 +1039,19 @@ def gui(path=None):
 
     def open_():
         start = os.path.dirname(st["path"]) if st["path"] else os.path.expanduser("~")
-        p = pick_file(False, start, "", "Images", ["*.png", "*.tif", "*.tiff", "*.jpg", "*.jpeg"])
-        if p: load(p)
+        p = pick_file(False, start, "", "Images", ["*.png", "*.tif", "*.tiff", "*.jpg", "*.jpeg", "*.webp"])
+        if not p:
+            return
+        if estimator_cmd() and looks_like_photo(p) and messagebox.askyesno(
+                "depth2stl", "This looks like a colour picture, not a depth map.\n\n"
+                "Estimate its depth with the local AI model first? (No = use its brightness as height)"):
+            return estimate_(p)
+        load(p)
 
-    def estimate_():
+    def estimate_(p=None):
         """Shaded render -> depth map via the external GPU estimator, then load it."""
         start = os.path.dirname(st["path"]) if st["path"] else os.path.expanduser("~")
-        p = pick_file(False, start, "", "Render or photo", ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.tif", "*.tiff"])
+        p = p or pick_file(False, start, "", "Render or photo", ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.tif", "*.tiff"])
         if not p:
             return
         out = os.path.splitext(p)[0] + "_depth.png"
@@ -898,6 +1065,25 @@ def gui(path=None):
             r = subprocess.run(estimator_cmd() + [p, out, "--detail", str(detail)], capture_output=True, text=True)
             q.put(("estimated", out, r.returncode, r.stderr.strip().splitlines()[-1:] or [""]))
         threading.Thread(target=run, daemon=True).start()
+
+    def fit_bit():
+        """Size the pipeline for the bit: ~4 mesh points across the tip, boost
+        detail up to ~1 mm, simplify well below the tip radius."""
+        p = params()
+        if p is None or st["h"] is None:
+            say("open an image first"); return
+        tip = p["tip"]
+        # px pitch at scale 1 for the current model width (cropped width if processed)
+        raw = p["x"] / (st["proc"].shape[1] - 1) * p["scale"] if st["proc"] is not None else p["x"] / (st["h"].shape[1] - 1)
+        want = tip / 4
+        scale = min(4, max(1, math.ceil(raw / want)))
+        pitch = raw / scale
+        vals = dict(scale=scale, smooth=0.5, passes=10, edge=3, boost=1.0, boost_radius=max(2, round(1.0 / pitch)),
+                    render_amt=0.8, tol=round(tip / 20, 3), detail=2400)
+        for k, val in vals.items():
+            v[k].set(val)
+        say(f"fit to Ø{tip:g} mm bit: ×{scale} → {pitch:.3f} mm/px ({tip / pitch:.1f} px across the tip)"
+            + ("; image too small for this width, more upscale won't add real detail" if pitch > want * 1.01 else ""))
 
     def export():
         if st["proc"] is None or st["busy"]:
@@ -927,7 +1113,10 @@ def gui(path=None):
 
     for k in PROC:
         v[k].trace_add("write", soon)
-    invert.trace_add("write", soon); rm_canvas.trace_add("write", soon)
+    invert.trace_add("write", soon); rm_canvas.trace_add("write", soon); sim.trace_add("write", soon)
+    for k in BIT:
+        v[k].trace_add("write", lambda *_: soon() if sim.get() else None)
+    v["tip"].trace_add("write", lambda *_: update_geom_stats(params()) if st["proc"] is not None and params() else None)
     for k in ("x", "y", "z"):
         v[k].trace_add("write", lambda *_, k=k: on_xyz(k))
     for k in ("base", "detail", "tol"):
@@ -964,6 +1153,22 @@ def check():
     # render detail: a stripe in the render lifts the height there
     rd = process(np.full((32, 64), 0.5, np.float32), render=bumpy, render_amt=1.0, boost_radius=4)
     assert rd.shape == (32, 64) and np.ptp(rd[:, 16:]) > 0.05
+
+    # bit simulation: a 1-px pit narrower than the tip fills in, a wide plateau and a lone peak's top survive
+    px = 0.05
+    flat = np.full((40, 40), 0.5, np.float32); flat[20, 20] = 0.0; flat[5:15, 5:15] = 0.9; flat[30, 30] = 1.0
+    sb = simulate_bit(flat, px, 8.0, 0.397, 10.0)
+    assert (sb >= flat - 1e-6).all(), "the bit can only leave material, never remove more"
+    assert sb[20, 20] > 0.49 and abs(sb[10, 10] - 0.9) < 1e-6 and abs(sb[30, 30] - 1.0) < 1e-6
+    assert abs(simulate_bit(flat, px, 8.0, 0.397, 0.0)[0, 0] - 0.5) < 1e-6, "straight ball end mill"
+    assert "finer than the bit" in bit_loss(flat, sb, 8.0) and bit_loss(flat, flat, 8.0).startswith("all")
+    wide = np.full((40, 40), 0.5, np.float32); wide[10:30, 10:30] = 0.0  # 1 mm pit, way wider than the tip
+    assert simulate_bit(wide, px, 8.0, 0.397, 0.0)[20, 20] < 1e-6, "wide pit must be cut to the bottom"
+    with tempfile.TemporaryDirectory() as dd:
+        g, c = os.path.join(dd, "g.png"), os.path.join(dd, "c.png")
+        Image.fromarray((flat * 255).astype(np.uint8)).save(g)
+        Image.fromarray(np.stack([flat * 255, flat * 60, flat * 0], 2).astype(np.uint8)).save(c)
+        assert not looks_like_photo(g) and looks_like_photo(c)
 
     def closed(verts, tris):
         """Every directed edge has exactly one reverse twin, no duplicates."""
@@ -1056,6 +1261,9 @@ def main():
     ap.add_argument("--z", type=float, default=8, help="relief height mm")
     ap.add_argument("--base", type=float, default=3)
     ap.add_argument("--invert", action="store_true")
+    ap.add_argument("--tip", type=float, default=0.397, help='bit tip diameter mm (1/64" = 0.397)')
+    ap.add_argument("--taper", type=float, default=10.0, help="bit taper degrees per side (0 = straight ball)")
+    ap.add_argument("--simulate-bit", action="store_true", help="keep only what the bit can carve")
     ap.add_argument("--check", action="store_true")
     a = ap.parse_args()
     if a.check:
@@ -1072,6 +1280,10 @@ def main():
         if a.remove_canvas:
             p, mask, zmul = remove_canvas(p, fade=a.fade)
             print(f"  {'remove leftover canvas':<24s} {time.time() - t0:6.2f} s  -> {p.shape[1]}x{p.shape[0]} px")
+        if a.simulate_bit:
+            cut = simulate_bit(p, a.x / (p.shape[1] - 1), a.z, a.tip, a.taper)
+            print(f"  {'bit simulation':<24s} {time.time() - t0:6.2f} s  -> {bit_loss(p, cut, a.z, mask)}")
+            p = cut
         H, W = p.shape
         y = a.y if a.y is not None else a.x * (H - 1) / (W - 1)
         n = to_stl(p, mask, a.out, a.x, y, a.z, a.base, zmul, a.tol)
