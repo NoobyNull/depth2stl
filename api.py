@@ -121,7 +121,16 @@ def run(job, d2s, say):
     t0 = time.time()
     h, note = d2s.load_height(src)
     if s["fit_to_bit"]:
-        s.update(fit(s["tip"], s["width"], h.shape[1]))
+        # the width is the kept figure's, so with the background removed the pitch comes
+        # from the figure's columns, not the whole canvas's
+        columns = h.shape[1]
+        if s["remove_canvas"]:
+            pre = 1.0 - h if s["invert"] else h
+            floor = s["floor"] / 100
+            if floor > 0:
+                pre = np.clip((pre - floor) / (1.0 - floor), 0.0, 1.0)
+            columns = d2s.remove_canvas(pre)[0].shape[1]
+        s.update(fit(s["tip"], s["width"], columns))
     render = d2s.load_render(job["render"]) if job.get("render") else None
     kw = dict(scale=s["scale"], smooth=s["smooth"], invert=s["invert"], floor=s["floor"] / 100,
               passes=s["passes"], edge=s["edge"] / 100, boost=s["boost"],
@@ -223,6 +232,11 @@ def check(d2s):
         assert os.path.getsize(stl) == d2s.stl_bytes(r["triangles"])
         r2 = run({"input": src, "heightmap": hm, "settings": {"width": 50}}, d2s, lambda _: None)
         assert r2["settings"]["scale"] > 1 and r2["triangles"] is None, "fit to bit upscales a small map"
+        # a small figure on a wide canvas: fit to bit sizes for the figure, not the canvas
+        wide = np.zeros((60, 900), np.uint16); wide[20:40, 440:460] = 50000
+        Image.fromarray(wide).save(src)
+        r3 = run({"input": src, "heightmap": hm, "settings": {"width": 20}}, d2s, lambda _: None)
+        assert r3["settings"]["scale"] == 4, r3["settings"]["scale"]
         for job in ({"input": src}, {"heightmap": hm}, {"api": 2, "input": src, "heightmap": hm}):
             try:
                 run(job, d2s, lambda _: None)
