@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=depth2stl
+Comment=Depth map image to relief STL
+Exec=@BIN@/depth2stl %f
+Icon=depth2stl
+Terminal=false
+Categories=Graphics;3DGraphics;
+MimeType=image/png;image/jpeg;image/tiff;

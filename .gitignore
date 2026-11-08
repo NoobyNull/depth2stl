@@ -1,0 +1,5 @@
+.venv/
+build/
+build.log
+__pycache__/
+*.stl
