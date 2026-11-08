@@ -1,0 +1,25 @@
+#!/bin/bash
+# Zips a built program as a Cut Craft add-on: addon.toml (version and program filled in)
+# beside the program, into DIST/depth2stl-VERSION-PLATFORM.zip.
+#   scripts/package-addon PROGRAM VERSION PLATFORM DIST
+set -euo pipefail
+program=${1:?usage: scripts/package-addon PROGRAM VERSION PLATFORM DIST}
+version=${2:?} platform=${3:?} dist=${4:?}
+here=$(cd "$(dirname "$0")/.." && pwd)
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+name=$(basename "$program")
+cp "$program" "$stage/$name"
+chmod 755 "$stage/$name"
+sed -e "s/@VERSION@/$version/" -e "s/@PROGRAM@/$name/" "$here/addon/addon.toml" > "$stage/addon.toml"
+mkdir -p "$dist"
+out="$(cd "$dist" && pwd)/depth2stl-$version-$platform.zip"
+rm -f "$out"
+(cd "$stage" && python3 -c 'import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+    for f in sys.argv[2:]:
+        i = zipfile.ZipInfo.from_file(f, f)
+        i.external_attr = (0o100755 if f != "addon.toml" else 0o100644) << 16
+        with open(f, "rb") as fh:
+            z.writestr(i, fh.read(), zipfile.ZIP_DEFLATED)' "$out" addon.toml "$name")
+echo "$out"

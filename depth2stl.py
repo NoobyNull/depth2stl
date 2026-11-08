@@ -4,6 +4,7 @@
 GUI:  depth2stl [image.png]
 CLI:  depth2stl image.png -o out.stl [--scale 2 --passes 10 --remove-canvas ...]
 Test: depth2stl --check
+API:  depth2stl api describe | depth2stl api run < job.json   (see api.py; Cut Craft uses it)
 """
 import argparse
 import json
@@ -13,6 +14,7 @@ import queue
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,8 +22,11 @@ import time
 import numpy as np
 from PIL import Image
 
+__version__ = "1.1.0"  # build.sh stamps the binary with this
+
 Image.MAX_IMAGE_PIXELS = None
-os.environ.setdefault("PYOPENGL_PLATFORM", "x11")  # Tk is X11 (XWayland); EGL auto-pick breaks GLX
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("PYOPENGL_PLATFORM", "x11")  # Tk is X11 (XWayland); EGL auto-pick breaks GLX
 
 # Visual defaults for the 3D view. Edit here, not inline.
 VIEW = dict(bg=(0.13, 0.13, 0.14), color=(0.80, 0.72, 0.58), fov_deg=40.0,
@@ -1237,10 +1242,15 @@ def check():
         assert abs(rec["v"][..., 0].max() - 10) < 1e-4 and abs(rec["v"][..., 1].max() - 5) < 1e-4, "X/Y independent"
         cn = np.cross(rec["v"][:, 1] - rec["v"][:, 0], rec["v"][:, 2] - rec["v"][:, 0])
         assert ((cn * rec["n"]).sum(1) > 0).all()
+    import api
+    api.check(sys.modules[__name__])
     print("ok")
 
 
 def main():
+    if sys.argv[1:2] == ["api"]:  # the plugin API, before argparse so it owns its own arguments
+        import api
+        sys.exit(api.main(sys.argv[2:], sys.modules[__name__], __version__))
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="?")
     ap.add_argument("-o", "--out", help="write STL and exit (no GUI)")

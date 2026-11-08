@@ -1,0 +1,115 @@
+# Builds the compiled depth2stl for Linux and Windows on a v* tag (or by hand with a tag
+# name), checks each binary runs headless (--check and `api describe`), zips each as a
+# Cut Craft add-on, signs the zips with Cut Craft's release key and attaches them to the
+# GitHub release. Cut Craft's Add-ons window installs nothing unsigned.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release, e.g. v1.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 keeps the Linux binary runnable on older glibc distributions
+          - os: ubuntu-22.04
+            platform: linux-x64
+            exe: depth2stl
+          - os: windows-latest
+            platform: windows-x64
+            exe: depth2stl.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: The tag matches the version it was built from
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)".*/\1/p' depth2stl.py)
+          if [[ $TAG != "v$version" ]]; then
+            echo "::error::Tag $TAG is on a commit whose depth2stl.py says $version; not publishing."
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq patchelf ccache python3-tk
+      - run: pip install -r requirements.txt -r requirements-build.txt zstandard  # zstandard: a compressed onefile
+      - name: Compile with Nuitka
+        run: |
+          python -m nuitka --onefile --enable-plugin=tk-inter \
+            --include-package=OpenGL --include-package=pyopengltk --include-module=api \
+            --noinclude-pytest-mode=nofollow --noinclude-unittest-mode=nofollow --noinclude-setuptools-mode=nofollow \
+            --output-dir=build --output-filename=${{ matrix.exe }} --remove-output \
+            --product-version="$VERSION" --onefile-tempdir-spec='{CACHE_DIR}/depth2stl/{VERSION}' \
+            --assume-yes-for-downloads depth2stl.py
+      - name: It runs headless
+        run: |
+          build/${{ matrix.exe }} --check
+          build/${{ matrix.exe }} api describe | python -c "import json, sys; d = json.load(sys.stdin); assert d['version'] == '$VERSION', d['version']"
+      - run: scripts/package-addon build/${{ matrix.exe }} "$VERSION" ${{ matrix.platform }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: depth2stl-${{ matrix.platform }}
+          path: dist/*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # FILE.minisig beside each zip, made with Cut Craft's own release key (the same two
+      # secrets as the Cut-Craft repository), so Cut Craft can check the add-on is genuine
+      - name: Sign them
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [[ -z ${MINISIGN_SECRET_KEY:-} ]]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set: copy it and MINISIGN_PASSWORD from the Cut-Craft repository's Actions secrets"
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          for file in dist/*.zip; do
+            name=$(basename "$file")
+            printf '%s\n' "${MINISIGN_PASSWORD:-}" | minisign -S -s "$key" -m "$file" -t "file:$name"
+            minisign -V -q -p addon/cutcraft-release-key.pub -m "$file" >/dev/null \
+              || { echo "::error::the secret key is not Cut Craft's release key: Cut Craft would refuse these zips"; exit 1; }
+          done
+      - name: Attach them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag \
+                 --title "depth2stl $TAG" --generate-notes
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber
