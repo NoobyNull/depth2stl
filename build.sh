@@ -6,7 +6,7 @@
 # Builds from a clean venv holding only requirements*.txt (numpy, pillow, nuitka).
 set -euo pipefail
 cd "$(dirname "$0")"
-VERSION=1.0.0
+VERSION=1.1.0
 
 [[ "${1:-}" == install ]] || {
 [[ -x .venv/bin/nuitka ]] || { python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt -r requirements-build.txt; }
