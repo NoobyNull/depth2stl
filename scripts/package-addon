@@ -1,6 +1,7 @@
 #!/bin/bash
-# Zips a built program as a Cut Craft add-on: addon.toml (version and program filled in)
-# beside the program, into DIST/depth2stl-VERSION-PLATFORM.zip.
+# Zips a built program as a Cut Craft add-on: addon.toml (version filled in) beside the
+# program, into DIST/depth2stl-VERSION-PLATFORM.zip. PLATFORM is as Cut Craft names
+# computers: linux-x86_64 or windows-x86_64.
 #   scripts/package-addon PROGRAM VERSION PLATFORM DIST
 set -euo pipefail
 program=${1:?usage: scripts/package-addon PROGRAM VERSION PLATFORM DIST}
@@ -11,7 +12,7 @@ trap 'rm -rf "$stage"' EXIT
 name=$(basename "$program")
 cp "$program" "$stage/$name"
 chmod 755 "$stage/$name"
-sed -e "s/@VERSION@/$version/" -e "s/@PROGRAM@/$name/" "$here/addon/addon.toml" > "$stage/addon.toml"
+sed -e "s/@VERSION@/$version/" "$here/addon/addon.toml" > "$stage/addon.toml"
 mkdir -p "$dist"
 out="$(cd "$dist" && pwd)/depth2stl-$version-$platform.zip"
 rm -f "$out"

@@ -112,6 +112,9 @@ def run(job, d2s, say):
     progress. Returns the final report."""
     if job.get("api", API_VERSION) != API_VERSION:
         raise ValueError(f"this depth2stl speaks API {API_VERSION}, not {job.get('api')}")
+    for key in ("input", "render", "heightmap", "stl"):
+        if job.get(key) is not None and not isinstance(job[key], str):
+            raise ValueError(f"the job's {key} must be a file path")
     src = job.get("input")
     if not src:
         raise ValueError("the job names no input picture")
@@ -189,7 +192,10 @@ def main(argv, d2s, version):
         return 0
     if argv == ["run"]:
         try:
-            job = json.load(sys.stdin)
+            # bytes, not text: Cut Craft sends UTF-8, and Windows would otherwise read a
+            # path such as C:\\Users\\José\\... in the console's code page and not find it
+            raw = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read()
+            job = json.loads(raw)
             if not isinstance(job, dict):
                 raise ValueError("the job is not a JSON object")
             emit(run(job, d2s, emit))
@@ -247,6 +253,16 @@ def check(d2s):
         try:
             sys.stdin, sys.stdout = io.StringIO("[]"), io.StringIO()
             assert main(["run"], d2s, "t") == 1 and '"ok": false' in sys.stdout.getvalue()
+            # a UTF-8 job read right even where the console's code page is not UTF-8
+            odd = os.path.join(d, "Jos\u00e9")
+            os.mkdir(odd)
+            Image.fromarray(blob.astype(np.uint16)).save(os.path.join(odd, "in.png"))
+            job = {"input": os.path.join(odd, "in.png"), "heightmap": os.path.join(odd, "h.png"),
+                   "settings": {"width": 50}}
+            sent = json.dumps(job, ensure_ascii=False).encode("utf-8")
+            sys.stdin, sys.stdout = io.TextIOWrapper(io.BytesIO(sent), encoding="cp1252"), io.StringIO()
+            assert main(["run"], d2s, "t") == 0, sys.stdout.getvalue()
+            assert os.path.exists(job["heightmap"])
             sys.stdout = io.StringIO()
             assert main(["describe"], d2s, "t") == 0
             assert json.loads(sys.stdout.getvalue())["api"] == API_VERSION

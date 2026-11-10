@@ -1,7 +1,9 @@
 # Builds the compiled depth2stl for Linux and Windows on a v* tag (or by hand with a tag
 # name), checks each binary runs headless (--check and `api describe`), zips each as a
-# Cut Craft add-on, signs the zips with Cut Craft's release key and attaches them to the
-# GitHub release. Cut Craft's Add-ons window installs nothing unsigned.
+# Cut Craft add-on (Cut Craft's docs/addons.md) and attaches them to the GitHub release.
+# Signing is optional: with the MINISIGN secrets set the zips are signed with Cut Craft's
+# release key and install straight away; without them Cut Craft installs the add-on after
+# its unsigned warning.
 name: Release
 
 on:
@@ -27,10 +29,10 @@ jobs:
         include:
           # 22.04 keeps the Linux binary runnable on older glibc distributions
           - os: ubuntu-22.04
-            platform: linux-x64
+            platform: linux-x86_64
             exe: depth2stl
           - os: windows-latest
-            platform: windows-x64
+            platform: windows-x86_64
             exe: depth2stl.exe
     runs-on: ${{ matrix.os }}
     defaults:
@@ -84,16 +86,17 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      # FILE.minisig beside each zip, made with Cut Craft's own release key (the same two
-      # secrets as the Cut-Craft repository), so Cut Craft can check the add-on is genuine
+      # optional: FILE.minisig beside each zip, made with Cut Craft's own release key (the
+      # same two secrets as the Cut-Craft repository); unsigned zips still install, after
+      # Cut Craft's warning
       - name: Sign them
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           if [[ -z ${MINISIGN_SECRET_KEY:-} ]]; then
-            echo "::error::MINISIGN_SECRET_KEY is not set: copy it and MINISIGN_PASSWORD from the Cut-Craft repository's Actions secrets"
-            exit 1
+            echo "::warning::no signing key: these zips are unsigned, so Cut Craft warns before installing them"
+            exit 0
           fi
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           key=$(mktemp)

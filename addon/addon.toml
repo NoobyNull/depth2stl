@@ -1,13 +1,16 @@
-# depth2stl as a Cut Craft add-on, in Cut Craft's shared add-on layout: each release zip
-# holds this file (version filled in from the tag) and the compiled program, and Cut Craft
-# unpacks it per user into <add-ons folder>/depth2stl/. Cut Craft drives the program
-# through `depth2stl api` (see api.py).
+# depth2stl as a Cut Craft add-on, to Cut Craft's add-on contract (its docs/addons.md):
+# each release carries depth2stl-<version>-<os>-<arch>.zip holding this file (version
+# filled in from depth2stl.py) and the compiled program, and Cut Craft unpacks it per
+# user into <add-ons folder>/depth2stl/. Cut Craft drives the program through
+# `depth2stl api` (see api.py); it never shows depth2stl's own window.
 id = "depth2stl"
 name = "Depth to STL"
 kind = "tool"
 version = "@VERSION@"
-api = 1
 needs_cutcraft = ">=0.6.0"
-platforms = ["linux-x64", "windows-x64"]
+# the program; Cut Craft adds .exe on Windows
+program = "depth2stl"
+# the plugin API it speaks (`depth2stl api describe` says so too); a note for people,
+# as Cut Craft ignores keys it does not know
+api = 1
 license = "LicenseRef-depth2stl"
-files = ["@PROGRAM@"]
